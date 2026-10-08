@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Типы мостов в AR</title>
+
+  <!-- Диагностика: сообщения выводятся в зелёный блок внизу страницы -->
+  <script>
+    window.__dbg = [];
+    function dbg(msg) {
+      console.log(msg);
+      window.__dbg.push(String(msg));
+      const el = document.getElementById('debug');
+      if (el) el.textContent = window.__dbg.join('\n');
+    } 
+    window.addEventListener('error', e => dbg('ОШИБКА: ' + e.message));
+    window.addEventListener('unhandledrejection', e => dbg('ОШИБКА (promise): ' + ((e.reason && e.reason.message) || e.reason)));
+  </script>
+
+  <script src="js/aframe.min.js"></script>
+  <script src="js/aframe-ar.js"></script>
+  <script src="js/aframe-extras.min.js"></script>
+
+  <script>
+    // Автоподгонка размера модели: самая длинная сторона = size
+    AFRAME.registerComponent('fit-to-size', {
+      schema: { size: { type: 'number', default: 1 } },
+      init: function () {
+        const THREE = AFRAME.THREE;
+        this.el.addEventListener('model-loaded', () => {
+          const mesh = this.el.getObject3D('mesh');
+          if (!mesh) return;
+          const tmp = new THREE.Object3D();
+          tmp.add(mesh.clone());
+          tmp.updateMatrixWorld(true);
+          const box = new THREE.Box3().setFromObject(tmp);
+          const size = new THREE.Vector3();
+          const center = new THREE.Vector3();
+          box.getSize(size);
+          box.getCenter(center);
+          const max = Math.max(size.x, size.y, size.z);
+          if (!max) return;
+          const k = this.data.size / max;
+          mesh.scale.setScalar(k);
+          mesh.position.set(-center.x * k, -box.min.y * k, -center.z * k);
+        });
+      }
+    });
+
+    // Двусторонние материалы и отключение отсечения по кадру
+    AFRAME.registerComponent('fix-materials', {
+      init: function () {
+        this.el.addEventListener('model-loaded', () => {
+          const mesh = this.el.getObject3D('mesh');
+          if (!mesh) return;
+          mesh.traverse(o => {
+            if (!o.isMesh && !o.isLine && !o.isPoints) return;
+            o.frustumCulled = false;
+            const mats = Array.isArray(o.material) ? o.material : [o.material];
+            mats.forEach(m => {
+              if (m) { m.side = AFRAME.THREE.DoubleSide; m.needsUpdate = true; }
+            });
+          });
+        });
+      }
+    });
+
+    // Анимация аватара: постоянно играет idle, на ответ поверх один раз машет wave
+    AFRAME.registerComponent('avatar-anim', {
+      schema: {
+        clip: { type: 'string', default: 'wave' },
+        idle: { type: 'string', default: 'idle' }
+      },
+      init: function () {
+        const THREE = AFRAME.THREE;
+        this.mixer = null;
+        this.waveAction = null;
+        this.armAction = null;
+
+        this.el.addEventListener('model-loaded', () => {
+          const mesh = this.el.getObject3D('mesh');
+          const clips = (mesh && mesh.animations) || [];
+          if (!clips.length) return;
+          const find = name => {
+            const n = name.toLowerCase();
+            return clips.find(c => c.name.toLowerCase() === n)
+                || clips.find(c => c.name.toLowerCase().includes(n));
+          };
+
+          const waveClip = find(this.data.clip);
+          if (!waveClip) {
+            return;
+          }
+          const idleClip = find(this.data.idle) || clips.find(c => c !== waveClip);
+          // Оставляем в wave только дорожки, где значения реально меняются
+          const isMoving = t => {
+            const vs = t.getValueSize();
+            const v = t.values;
+            for (let i = vs; i < v.length; i++) {
+              if (Math.abs(v[i] - v[i % vs]) > 1e-3) return true;
+            }
+            return false;
+          };
+          let moving = waveClip.tracks.filter(isMoving);
+          if (!moving.length) moving = waveClip.tracks;
+          const names = new Set(moving.map(t => t.name));
+
+          this.mixer = new THREE.AnimationMixer(mesh);
+
+          const waveTrim = new THREE.AnimationClip('wave-moving', waveClip.duration, moving);
+          this.waveAction = this.mixer.clipAction(waveTrim);
+          this.waveAction.setLoop(THREE.LoopOnce, 1);
+          this.waveAction.clampWhenFinished = true;
+
+          if (idleClip) {
+            const base = new THREE.AnimationClip('idle-base', idleClip.duration,
+              idleClip.tracks.filter(t => !names.has(t.name)));
+            const arm = new THREE.AnimationClip('idle-arm', idleClip.duration,
+              idleClip.tracks.filter(t => names.has(t.name)));
+            this.mixer.clipAction(base).play();
+            this.armAction = this.mixer.clipAction(arm);
+            this.armAction.play();
+          } else {
+            this.restPose();
+          }
+
+          this.mixer.addEventListener('finished', e => {
+            if (e.action !== this.waveAction) return;
+            if (this.armAction) {
+              this.waveAction.stop();
+              this.armAction.setEffectiveWeight(1);
+            } else {
+              this.restPose();
+            }
+          });
+        });
+      },
+      restPose: function () {
+        this.waveAction.reset();
+        this.waveAction.play();
+        this.waveAction.paused = true;
+        this.waveAction.time = 0;
+        this.mixer.update(0);
+      },
+      wave: function () {
+        if (!this.waveAction) return;
+        if (this.armAction) this.armAction.setEffectiveWeight(0);
+        this.waveAction.reset();
+        this.waveAction.setEffectiveWeight(1);
+        this.waveAction.paused = false;
+        this.waveAction.play();
+      },
+      tick: function (time, delta) {
+        if (this.mixer) this.mixer.update(delta / 1000);
+      }
+    });
+  </script>
+
+  <style>
+    body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+    #ui {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+      background: rgba(0, 0, 0, 0.78); color: #fff; padding: 10px;
+      max-height: 55vh; overflow-y: auto;
+    }
+    #marker-status { font-size: 13px; color: #ffcc66; }
+    #recognized { font-size: 13px; color: #7fd1ff; min-height: 16px; }
+    #question-text { font-size: 13px; color: #bbb; min-height: 16px; }
+    #answer { font-size: 15px; line-height: 1.4; margin: 4px 0 8px; min-height: 20px; }
+    .row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .row button {
+      padding: 8px 10px; border: none; border-radius: 6px;
+      background: #2d7ff9; color: #fff; font-size: 14px;
+    }
+    .row button.topic { background: #8a5cf6; }
+    #ask { display: flex; gap: 6px; }
+    #question { flex: 1; min-width: 0; padding: 8px; font-size: 14px; border-radius: 6px; border: none; }
+    #send { padding: 8px 12px; border: none; border-radius: 6px; background: #2db36b; color: #fff; }
+    #mic { padding: 8px 12px; border: none; border-radius: 6px; background: #555; color: #fff; font-size: 16px; }
+    #mic.on { background: #e03b3b; }
+  </style>
+</head>
+<body>
+
+  <a-scene embedded arjs="sourceType: webcam; debugUIEnabled: false; cameraParametersUrl: data/camera_para.dat;" vr-mode-ui="enabled: false">
+    <a-marker type="pattern" url="markers/pattern-inner-kanji.patt">
+      <!-- rotation="-90 0 0": для вертикально поднятого телефона.
+           Если маркер лежит на столе, поставьте "0 0 0" -->
+      <a-entity id="content" rotation="-90 0 0">
+        <a-entity id="avatar"
+                  gltf-model="url(models/avatar.glb)"
+                  avatar-anim
+                  rotation="0 60 0"
+                  position="-1.4 0 0"
+                  scale="0.6 0.6 0.6"></a-entity>
+
+        <a-entity id="bridge" visible="false" fit-to-size="size: 2.6" fix-materials></a-entity>
+      </a-entity>
+    </a-marker>
+    <a-entity camera></a-entity>
+  </a-scene>
+
+  <div id="ui">
+    <div id="marker-status">Маркер: не найден</div>
+    <div id="recognized"></div>
+    <div id="question-text"></div>
+    <div id="answer">Добро пожаловать! Выберите интересующий вас мост, чтобы узнать информацию о его допустимых нагрузках и устойчивости, нажмите 🎤 или напишите вопрос в строку ввода.</div>
+    <div id="objects" class="row"></div>
+    <div id="topics" class="row">
+      <button class="topic" data-topic="load">Нагрузка</button>
+      <button class="topic" data-topic="stability">Устойчивость</button>
+    </div>
+    <div id="ask">
+      <input id="question" type="text" placeholder="Например: как распределяется нагрузка в арочном мосте?">
+      <button id="mic" title="Голосовой ввод">🎤</button>
+      <button id="send">Спросить</button>
+    </div>
+  </div>
+
+  <script>
+    let qa = [];
+    let lastObject = null;
+
+    // Общий поворот мостов вокруг вертикальной оси (подберите 90, -90 или 180).
+    // Для отдельного моста можно задать поле "rotation" в data/qa.json
+    const BRIDGE_ROTATION = '0 90 0';
+
+    const recognizedEl = document.getElementById('recognized');
+    const questionTextEl = document.getElementById('question-text');
+    const answerEl = document.getElementById('answer');
+    const objectsEl = document.getElementById('objects');
+    const bridgeEl = document.getElementById('bridge');
+    const inputEl = document.getElementById('question');
+    const micEl = document.getElementById('mic');
+    const markerEl = document.querySelector('a-marker');
+    const markerStatusEl = document.getElementById('marker-status');
+
+    markerEl.addEventListener('markerFound', () => { markerStatusEl.textContent = 'Маркер: найден'; });
+    markerEl.addEventListener('markerLost', () => { markerStatusEl.textContent = 'Маркер: не найден'; });
+
+    const TOPICS = [
+      { key: 'load', words: ['нагруз', 'распредел', 'вес', 'давлен', 'сил'] },
+      { key: 'stability', words: ['устойчив', 'стабильн', 'прочн', 'ветр', 'надежн'] }
+    ];
+
+    function normalize(s) {
+      return s.toLowerCase().replace(/ё/g, 'е');
+    }
+
+    // ---------- Загрузка данных ----------
+    fetch('data/qa.json')
+      .then(r => r.json())
+      .then(data => {
+        qa = data;
+        qa.forEach(item => {
+          const b = document.createElement('button');
+          b.textContent = item.title;
+          b.onclick = () => handleQuestion('Расскажи про ' + item.title.toLowerCase());
+          objectsEl.appendChild(b);
+        });
+      })
+      .catch(() => { answerEl.textContent = 'Не удалось загрузить data/qa.json'; });
+
+    // ---------- Распознавание объекта и темы ----------
+    function findObject(text) {
+      const t = normalize(text);
+      return qa.find(item => item.keywords.some(k => t.includes(normalize(k))));
+    }
+
+    function findTopic(text) {
+      const t = normalize(text);
+      const topic = TOPICS.find(tp => tp.words.some(w => t.includes(w)));
+      return topic ? topic.key : 'about';
+    }
+
+    // ---------- Обработка вопроса ----------
+    function handleQuestion(text) {
+      text = text.trim();
+      if (!text) return;
+      questionTextEl.textContent = 'Вы: ' + text;
+
+      const found = findObject(text);
+      const obj = found || lastObject;
+      const topic = findTopic(text);
+
+      if (!obj) {
+        const msg = 'Я рассказываю про типы мостов: балочный, арочный, висячий, вантовый, на понтонах и разводной. О каком из них вам рассказать?';
+        recognizedEl.textContent = '';
+        answerEl.textContent = msg;
+        speak(msg);
+        return;
+      }
+
+      lastObject = obj;
+      recognizedEl.textContent = 'Распознан объект: ' + obj.title;
+      const answer = obj.answers[topic];
+      answerEl.textContent = answer;
+      showBridge(obj);
+      speak(answer);
+    }
+
+    function showBridge(obj) {
+      bridgeEl.setAttribute('gltf-model', obj.model);
+      bridgeEl.setAttribute('scale', obj.scale);
+      bridgeEl.setAttribute('position', obj.position);
+      bridgeEl.setAttribute('rotation', obj.rotation || BRIDGE_ROTATION);
+      bridgeEl.setAttribute('visible', 'true');
+    }
+
+    // ---------- Анимация и голосовой вывод ----------
+    function waveAvatar() {
+      const comp = document.getElementById('avatar').components['avatar-anim'];
+      if (comp) comp.wave();
+    }
+
+    function speak(text) {
+      waveAvatar();
+      if (!('speechSynthesis' in window)) return;
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ru-RU';
+      speechSynthesis.speak(u);
+    }
+
+    // ---------- Голосовой ввод ----------
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    let recognition = null;
+
+    if (SR) {
+      recognition = new SR();
+      recognition.lang = 'ru-RU';
+      recognition.interimResults = false;
+      recognition.maxAlternatives = 1;
+
+      recognition.onresult = e => {
+        const text = e.results[0][0].transcript;
+        inputEl.value = text;
+        handleQuestion(text);
+      };
+      recognition.onend = () => micEl.classList.remove('on');
+      recognition.onerror = e => {
+        micEl.classList.remove('on');
+        answerEl.textContent = 'Ошибка голосового ввода: ' + e.error;
+      };
+
+      micEl.onclick = () => {
+        speechSynthesis.cancel();
+        try {
+          recognition.start();
+          micEl.classList.add('on');
+        } catch (err) { /* распознавание уже запущено */ }
+      };
+    } else {
+      micEl.disabled = true;
+      micEl.title = 'Голосовой ввод не поддерживается этим браузером';
+    }
+
+    // ---------- Текстовый ввод и кнопки ----------
+    function sendText() {
+      handleQuestion(inputEl.value);
+      inputEl.value = '';
+    }
+    document.getElementById('send').onclick = sendText;
+    inputEl.addEventListener('keydown', e => { if (e.key === 'Enter') sendText(); });
+
+    document.querySelectorAll('#topics button').forEach(b => {
+      b.onclick = () => {
+        const label = b.dataset.topic === 'load' ? 'Как распределяется нагрузка?' : 'Как обеспечивается устойчивость?';
+        handleQuestion(label);
+      };
+    });
+  </script>
+</body>
+</html>
